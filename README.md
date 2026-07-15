@@ -23,6 +23,7 @@ operators.
 ## API
 
 ```text
+GET  /
 GET  /dashboard/health
 POST /dashboard/run?mode=dry_run
 POST /dashboard/run?mode=commit
