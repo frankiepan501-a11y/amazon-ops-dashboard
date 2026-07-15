@@ -27,6 +27,13 @@ Implemented and verified:
   - Active: `true`
   - Schedule: 09:40 + 13:30 BJ
   - `activeVersionId`: `be169eb3-8730-4d2d-b7a1-1ec9046581b9`
+- Web dashboard:
+  - `GET /` is now the operator-facing Amazon operations cockpit.
+  - `GET /api/dashboard` reads the three Feishu dashboard tables and reorganizes
+    rows into KPIs, business modules, priority actions, source health, owner
+    workload, and a detail pool.
+  - The Feishu Base remains the source-of-truth/detail layer; the web page is
+    the management presentation layer.
 
 ## Deployed Configuration
 

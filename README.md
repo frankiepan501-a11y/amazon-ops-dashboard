@@ -24,10 +24,15 @@ operators.
 
 ```text
 GET  /
+GET  /api/dashboard
 GET  /dashboard/health
 POST /dashboard/run?mode=dry_run
 POST /dashboard/run?mode=commit
 ```
+
+`GET /` is the operator-facing dashboard. It reads the Feishu Base rows through
+`GET /api/dashboard` and reorganizes them into summary KPIs, business modules,
+priority actions, source health, owner workload, and a detail pool.
 
 If `DASHBOARD_API_TOKEN` is set, `POST /dashboard/run` requires:
 
