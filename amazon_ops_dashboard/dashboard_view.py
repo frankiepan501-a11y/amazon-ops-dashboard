@@ -164,7 +164,10 @@ def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
         completed_actions = [x for x in related if is_done(x) or x["status"] in NO_ACTION_STATUSES]
         flags = wanci_issue_flags(latest)
         issue_count = max(len(flags), len(related))
-        if not flags and not open_actions:
+        if latest["missing_review_fields"]:
+            progress = 10
+            stage = "先补资料"
+        elif not flags and not open_actions:
             progress = 100
             stage = "观察中"
         elif open_actions:
@@ -188,8 +191,9 @@ def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
             "history": history[:8],
         })
 
+    stage_order = {"先补资料": 0, "待处理": 1, "待确认": 2, "观察中": 3}
     plans = sorted(plans, key=lambda x: (
-        0 if x["stage"] == "待处理" else 1 if x["stage"] == "待确认" else 2,
+        stage_order.get(x["stage"], 9),
         -(x["todo_open"] * 100 + len(x["issues"]) * 10),
         x["owner"],
         x["site"],
@@ -210,7 +214,9 @@ def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
             "listing_abnormal": sum(1 for x in plans if x["daily_update"] == "会每天更新" and x["listing_status"] not in ("", "正常")),
             "budget_exhausted": sum(1 for x in plans if x["daily_update"] == "会每天更新" and x["budget_exhausted"] > 0),
             "no_rank_tracking": sum(1 for x in plans if x["rank_tracking"] == "否"),
+            "missing_review_config": sum(1 for x in plans if x["missing_review_fields"]),
             "stale_snapshots": sum(1 for x in plans if x["snapshot_ms"] and x["age_days"] > 10 and x["daily_update"] == "会每天更新"),
+            "review_failed": sum(1 for x in plans if not x["snapshot_ms"] and x["daily_update"] == "会每天更新" and not x["missing_review_fields"]),
             "missing_snapshots": sum(1 for x in plans if not x["snapshot_ms"] and x["daily_update"] == "会每天更新"),
         },
         "owners": owner_rows,
@@ -263,6 +269,9 @@ def normalize_wanci_registry(rec: dict[str, Any], cfg: Config) -> dict[str, Any]
     registry_status = text_value(f.get("状态"))
     daily_update = text_value(f.get("是否每天更新"))
     rank_updated_ms = parse_time_value(f.get("最近排名更新时间"))
+    store_id = text_value(f.get("店铺sid"))
+    seller_sku = text_value(f.get("seller_sku")) or text_value(f.get("seller_sku(可空自动查)"))
+    category = text_value(f.get("品类"))
     return {
         "registry_record_id": record_id,
         "group_key": wanci_group_key(site, asin, product, owner) or record_id,
@@ -275,6 +284,9 @@ def normalize_wanci_registry(rec: dict[str, Any], cfg: Config) -> dict[str, Any]
         "rank_table_id": rank_table_id,
         "rank_updated_ms": rank_updated_ms,
         "rank_updated_at": date_text(rank_updated_ms),
+        "store_id": store_id,
+        "seller_sku": seller_sku,
+        "category": category,
         "registry_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_registry.app_token}?table={cfg.wanci_registry.table_id}&record={record_id}",
     }
 
@@ -295,6 +307,9 @@ def merge_wanci_current(current: dict[str, Any] | None, snapshot: dict[str, Any]
             "rank_table_id": current["rank_table_id"],
             "rank_updated_ms": current["rank_updated_ms"],
             "rank_updated_at": current["rank_updated_at"],
+            "store_id": current["store_id"],
+            "seller_sku": current["seller_sku"],
+            "category": current["category"],
             "registry_url": current["registry_url"],
             "source_url": current["registry_url"],
         }
@@ -312,6 +327,9 @@ def merge_wanci_current(current: dict[str, Any] | None, snapshot: dict[str, Any]
             "rank_table_id": "",
             "rank_updated_ms": 0,
             "rank_updated_at": "",
+            "store_id": "",
+            "seller_sku": "",
+            "category": "",
             "registry_url": "",
             "source_url": snapshot["source_url"] if snapshot else "",
         }
@@ -343,6 +361,8 @@ def merge_wanci_current(current: dict[str, Any] | None, snapshot: dict[str, Any]
             "page_delta": 0,
             "snapshot_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_weekly.app_token}?table={cfg.wanci_weekly.table_id}",
         })
+    base["missing_review_fields"] = wanci_missing_review_fields(base)
+    base["missing_review_text"] = "、".join(base["missing_review_fields"])
     return base
 
 
@@ -354,12 +374,15 @@ def wanci_issue_flags(item: dict[str, Any]) -> list[str]:
     flags = []
     if item["daily_update"] and item["daily_update"] != "会每天更新":
         return flags
+    if item["missing_review_fields"]:
+        flags.append(f"资料没填全：缺{item['missing_review_text']}，暂时查不了 Listing")
+        return flags
     if truthy_text(item["failure"]):
         flags.append("存在失职项")
     if item["budget_exhausted"] > 0:
         flags.append(f"预算耗尽 {item['budget_exhausted']} 个")
     if item["rank_tracking"] == "否":
-        flags.append("未建 Rank 追踪")
+        flags.append("未建排名表")
     if item["listing_status"] not in ("", "正常"):
         flags.append(f"Listing 状态：{item['listing_status']}")
     if item["include_delta"] < 0:
@@ -367,10 +390,23 @@ def wanci_issue_flags(item: dict[str, Any]) -> list[str]:
     if item["page_delta"] < 0:
         flags.append(f"首页下降 {item['page_delta']}")
     if not item["snapshot_ms"] and item["daily_update"] == "会每天更新":
-        flags.append("暂无周复审快照")
+        flags.append("还没有复查记录")
     elif item["age_days"] > 10 and item["daily_update"] == "会每天更新":
-        flags.append(f"快照 {item['age_days']} 天未更新")
+        flags.append(f"复查记录 {item['age_days']} 天没更新")
     return flags
+
+
+def wanci_missing_review_fields(item: dict[str, Any]) -> list[str]:
+    if item["registry_status"] != "在跑" or item["daily_update"] != "会每天更新":
+        return []
+    missing = []
+    if not item["owner"] or item["owner"] == "未分配":
+        missing.append("负责人")
+    if not item["store_id"]:
+        missing.append("店铺编号")
+    if not item["seller_sku"]:
+        missing.append("商品编号")
+    return missing
 
 
 def dedupe_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1453,8 +1489,8 @@ WANCI_HTML = """<!doctype html>
       </nav>
       <div class="source-card">
         <div>数据源</div>
-        <strong>万词总台 + 周快照</strong>
-        <div>总台决定当前项目与 Rank 配置；周快照展示 Listing 变化。</div>
+        <strong>万词总台 + 复查记录</strong>
+        <div>总台决定有哪些项目；复查记录展示 Listing 和广告有没有变化。</div>
         <div id="sideStatus">正在读取数据...</div>
       </div>
     </aside>
@@ -1463,7 +1499,7 @@ WANCI_HTML = """<!doctype html>
         <div>
           <div class="eyebrow">Wanci Plan Operations</div>
           <h1>万词计划工作台</h1>
-          <div class="subtitle">把万词计划从首页拆出来，按 ASIN/站点/产品展示跟进进度、Listing 变化、Rank 追踪、预算耗尽和待办完成情况。当前项目以总台注册表为准，周快照只作为复审历史。</div>
+          <div class="subtitle">按产品、站点和 ASIN 看万词计划进度：资料是否填全、Listing 有没有变化、排名表是否已建、广告预算是否卡住、待办是否完成。</div>
         </div>
         <div class="actions">
           <span id="refreshText">未刷新</span>
@@ -1483,16 +1519,18 @@ WANCI_HTML = """<!doctype html>
             <select id="ownerFilter"></select>
             <select id="stageFilter">
               <option value="">全部阶段</option>
+              <option value="先补资料">先补资料</option>
               <option value="待处理">待处理</option>
               <option value="待确认">待确认</option>
               <option value="观察中">观察中</option>
             </select>
             <select id="issueFilter">
               <option value="">全部问题</option>
+              <option value="config">资料没填全</option>
               <option value="listing">Listing异常</option>
-              <option value="rank">未建Rank追踪</option>
+              <option value="rank">未建排名表</option>
               <option value="budget">预算耗尽</option>
-              <option value="stale">快照过期</option>
+              <option value="stale">复查记录过旧</option>
             </select>
           </div>
           <div id="taskList" class="task-list"></div>
@@ -1534,6 +1572,7 @@ WANCI_HTML = """<!doctype html>
     }
 
     function issueClass(plan) {
+      if (plan.stage === "先补资料") return "bad";
       if (plan.stage === "待处理") return "bad";
       if (plan.stage === "待确认") return "warn";
       return "";
@@ -1574,9 +1613,10 @@ WANCI_HTML = """<!doctype html>
         ["已完成/关闭", s.todo_done, "来自待办状态", "ok"],
         ["Listing异常", s.listing_abnormal, "listing状态非正常", s.listing_abnormal ? "warn" : "ok"],
         ["预算耗尽", s.budget_exhausted, "需要广告预算判断", s.budget_exhausted ? "warn" : ""],
-        ["未建Rank追踪", s.no_rank_tracking, "按总台 rank子表id 判断", s.no_rank_tracking ? "warn" : "ok"],
-        ["快照过期", s.stale_snapshots, "已有快照但超过 10 天", s.stale_snapshots ? "warn" : "ok"],
-        ["无周快照", s.missing_snapshots, "总台在跑但未进入复审表", s.missing_snapshots ? "danger" : "ok"],
+        ["未建排名表", s.no_rank_tracking, "需要补建关键词排名表", s.no_rank_tracking ? "warn" : "ok"],
+        ["资料没填全", s.missing_review_config, "缺负责人、店铺编号或商品编号", s.missing_review_config ? "danger" : "ok"],
+        ["复查失败", s.review_failed, "资料齐了但没有复查记录", s.review_failed ? "danger" : "ok"],
+        ["复查过旧", s.stale_snapshots, "超过 10 天没复查", s.stale_snapshots ? "warn" : "ok"],
       ];
       $("kpis").innerHTML = cards.map(([label, value, hint, cls]) => `
         <article class="card kpi ${cls}">
@@ -1604,6 +1644,7 @@ WANCI_HTML = """<!doctype html>
         if (q && !hay.includes(q)) return false;
         if (owner && p.owner !== owner) return false;
         if (stage && p.stage !== stage) return false;
+        if (issue === "config" && !p.missing_review_fields?.length) return false;
         if (issue === "listing" && ["", "正常"].includes(p.listing_status)) return false;
         if (issue === "rank" && p.rank_tracking !== "否") return false;
         if (issue === "budget" && !p.budget_exhausted) return false;
@@ -1626,7 +1667,7 @@ WANCI_HTML = """<!doctype html>
               <div class="task-title">${esc(p.product || p.asin || "未命名计划")}</div>
               <div class="hint">${esc(p.site || "无站点")} · ${esc(p.asin || "无ASIN")} · ${esc(p.owner)}</div>
             </div>
-            ${tag(p.stage, p.stage === "待处理" ? "bad" : p.stage === "待确认" ? "warn" : "ok")}
+            ${tag(p.stage, p.stage === "先补资料" || p.stage === "待处理" ? "bad" : p.stage === "待确认" ? "warn" : "ok")}
           </div>
           <div class="progress"><span style="width:${Math.max(3, p.progress)}%"></span></div>
           <div class="task-meta">
@@ -1634,7 +1675,8 @@ WANCI_HTML = """<!doctype html>
             ${tag(`进度 ${p.progress}%`)}
             ${tag(`待办 ${p.todo_done}/${p.todo_total}`)}
             ${tag(`Listing ${p.listing_status || "正常"}`, p.listing_status && p.listing_status !== "正常" ? "warn" : "ok")}
-            ${p.rank_tracking === "否" ? tag("未建Rank", "warn") : ""}
+            ${p.missing_review_fields?.length ? tag("资料没填全", "bad") : ""}
+            ${p.rank_tracking === "否" ? tag("未建排名表", "warn") : ""}
           </div>
         </button>
       `).join("");
@@ -1664,26 +1706,27 @@ WANCI_HTML = """<!doctype html>
           <div class="mini"><span>待办完成</span><strong>${esc(p.todo_done)}/${esc(p.todo_total)}</strong></div>
           <div class="mini"><span>收录变化</span><strong>${esc(p.include_delta)}</strong></div>
           <div class="mini"><span>首页变化</span><strong>${esc(p.page_delta)}</strong></div>
-          <div class="mini"><span>快照距今</span><strong>${esc(p.age_days)}天</strong></div>
+          <div class="mini"><span>上次复查</span><strong>${p.snapshot ? esc(p.snapshot) : "暂无"}</strong></div>
         </div>
         <div class="todo-list">
           <div class="todo">
             <strong>${esc(p.product || p.asin)}</strong>
             站点：${esc(p.site || "无")}　ASIN：${esc(p.asin || "无")}　负责人：${esc(p.owner)}<br />
-            总台状态：${esc(p.registry_status || "未登记")}　更新策略：${esc(p.daily_update || "无")}<br />
-            Listing状态：${esc(p.listing_status || "正常")}　Rank追踪：${esc(p.rank_tracking || "无")}　Rank最近更新：${esc(p.rank_updated_at || "无")}　预算耗尽：${esc(p.budget_exhausted)}
+            计划状态：${esc(p.registry_status || "未登记")}　是否每天更新：${esc(p.daily_update || "无")}<br />
+            资料状态：${p.missing_review_fields?.length ? `缺 ${esc(p.missing_review_text)}` : "已填全"}<br />
+            Listing状态：${esc(p.listing_status || "正常")}　排名表：${esc(p.rank_tracking || "无")}　排名最近更新：${esc(p.rank_updated_at || "无")}　预算卡住：${esc(p.budget_exhausted)}
             <br /><a class="source-link" href="${esc(p.registry_url || p.source_url)}" target="_blank" rel="noreferrer">打开万词总台记录</a>
-            ${p.snapshot_url ? ` · <a class="source-link" href="${esc(p.snapshot_url)}" target="_blank" rel="noreferrer">打开周快照记录</a>` : ""}
+            ${p.snapshot_url ? ` · <a class="source-link" href="${esc(p.snapshot_url)}" target="_blank" rel="noreferrer">打开复查记录</a>` : ""}
           </div>
           ${p.issues.length ? `<div class="todo"><strong>当前问题</strong>${p.issues.map((x) => `<div>${esc(x)}</div>`).join("")}</div>` : `<div class="todo"><strong>当前问题</strong>没有明显异常，保持观察。</div>`}
           ${renderTodos(p)}
         </div>
-        <h3 style="margin:16px 0 8px;">Listing 快照变化</h3>
+        <h3 style="margin:16px 0 8px;">Listing 复查变化</h3>
         <div class="timeline">
           ${p.history.map((h) => `
             <div class="row">
               <strong>${esc(h.snapshot || "无日期")}</strong>
-              <span>Listing：${esc(h.listing_status || "正常")} · 快照Rank：${esc(h.rank_tracking || "无")} · 预算耗尽：${esc(h.budget_exhausted)}</span>
+              <span>Listing：${esc(h.listing_status || "正常")} · 排名表：${esc(h.rank_tracking || "无")} · 预算卡住：${esc(h.budget_exhausted)}</span>
               <span>收录Δ ${esc(h.include_delta)} / 首页Δ ${esc(h.page_delta)}</span>
             </div>
           `).join("")}

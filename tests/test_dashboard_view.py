@@ -89,6 +89,8 @@ class DashboardViewTest(unittest.TestCase):
                         "产品": "测试手柄",
                         "状态": "在跑",
                         "是否每天更新": "会每天更新",
+                        "店铺sid": "1182",
+                        "seller_sku": "SKU-US",
                     },
                 }
             ],
@@ -156,7 +158,7 @@ class DashboardViewTest(unittest.TestCase):
         self.assertEqual("待处理", plan["stage"])
         self.assertEqual(2, len(plan["history"]))
         self.assertEqual(1, len(plan["open_actions"]))
-        self.assertIn("未建 Rank 追踪", plan["issues"])
+        self.assertIn("未建排名表", plan["issues"])
 
     def test_wanci_registry_rank_overrides_stale_snapshot_rank_status(self):
         cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
@@ -172,6 +174,8 @@ class DashboardViewTest(unittest.TestCase):
                         "状态": "在跑",
                         "是否每天更新": "会每天更新",
                         "rank子表id": "tblRank",
+                        "店铺sid": "1194",
+                        "seller_sku": "SKU-DE",
                     },
                 }
             ],
@@ -199,16 +203,15 @@ class DashboardViewTest(unittest.TestCase):
         self.assertEqual(0, payload["summary"]["no_rank_tracking"])
         plan = payload["plans"][0]
         self.assertEqual("是", plan["rank_tracking"])
-        self.assertNotIn("未建 Rank 追踪", plan["issues"])
+        self.assertNotIn("未建排名表", plan["issues"])
 
-    def test_wanci_registry_active_without_snapshot_is_missing_review(self):
+    def test_wanci_registry_active_without_required_info_needs_plain_language_fix(self):
         cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
         fake = _FakeLark({
             cfg.wanci_registry.table_id: [
                 {
                     "record_id": "reg1",
                     "fields": {
-                        "负责运营": "陈翔宇",
                         "站点": "UK",
                         "ASIN": "B0NOSNAP",
                         "产品": "无快照产品",
@@ -224,10 +227,46 @@ class DashboardViewTest(unittest.TestCase):
 
         payload = build_wanci_payload(cfg, fake)
 
+        self.assertEqual(1, payload["summary"]["missing_review_config"])
+        self.assertEqual(0, payload["summary"]["review_failed"])
         self.assertEqual(1, payload["summary"]["missing_snapshots"])
         plan = payload["plans"][0]
+        self.assertEqual("先补资料", plan["stage"])
         self.assertEqual("是", plan["rank_tracking"])
-        self.assertIn("暂无周复审快照", plan["issues"])
+        self.assertEqual(["负责人", "店铺编号", "商品编号"], plan["missing_review_fields"])
+        self.assertIn("资料没填全：缺负责人、店铺编号、商品编号，暂时查不了 Listing", plan["issues"])
+
+    def test_wanci_registry_active_without_snapshot_after_required_info_is_review_failed(self):
+        cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
+        fake = _FakeLark({
+            cfg.wanci_registry.table_id: [
+                {
+                    "record_id": "reg1",
+                    "fields": {
+                        "负责运营": "陈翔宇",
+                        "站点": "UK",
+                        "ASIN": "B0NOSNAP",
+                        "产品": "无快照产品",
+                        "状态": "在跑",
+                        "是否每天更新": "会每天更新",
+                        "rank子表id": "tblRank",
+                        "店铺sid": "1192",
+                        "seller_sku": "SKU-UK",
+                    },
+                }
+            ],
+            cfg.wanci_weekly.table_id: [],
+            cfg.action_table_id: [],
+        })
+
+        payload = build_wanci_payload(cfg, fake)
+
+        self.assertEqual(0, payload["summary"]["missing_review_config"])
+        self.assertEqual(1, payload["summary"]["review_failed"])
+        plan = payload["plans"][0]
+        self.assertEqual("待确认", plan["stage"])
+        self.assertEqual("是", plan["rank_tracking"])
+        self.assertIn("还没有复查记录", plan["issues"])
 
 
 if __name__ == "__main__":

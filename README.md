@@ -50,6 +50,13 @@ unconnected. The workflow was repaired to
 page now uses registry `rank子表id` to decide Rank tracking status, preventing
 stale snapshots from falsely reporting active projects as missing Rank tracking.
 
+P1 wording fix on 2026-07-15: the Wanci page now separates projects that cannot
+be reviewed because required registry data is missing from projects where the
+review job actually failed. Operator-facing labels use plain wording:
+`资料没填全` means the registry row is missing `负责运营`, `店铺sid`, or
+`seller_sku`; `复查失败` means those fields are present but no review record was
+created.
+
 If `DASHBOARD_API_TOKEN` is set, `POST /dashboard/run` requires:
 
 ```text
