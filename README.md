@@ -62,6 +62,12 @@ AMZ_REVIEW_AUDIT_API_TOKEN
 `FEISHU_BITABLE_APP_ID` / `FEISHU_BITABLE_APP_SECRET` are preferred over the
 generic `FEISHU_APP_ID` pair because this service writes Bitable records.
 
+Production URL:
+
+```text
+https://amazon-ops-dashboard.zeabur.app
+```
+
 `SEARCH_TERM_SUMMARY_URL` should return JSON with either `actions` or `items`.
 Each action can include: `owner`, `type`, `site`, `asin`, `keyword`,
 `severity`, `suggested_action`, `source_url`.
@@ -96,4 +102,5 @@ Current n8n workflow:
 
 - ID: `3UVUiybjy4afjQDC`
 - Name: `AMZ - 亚马逊运营日看板刷新`
-- Status: inactive until the Zeabur service URL and token are configured.
+- Status: active
+- Schedule: 09:40 + 13:30 BJ

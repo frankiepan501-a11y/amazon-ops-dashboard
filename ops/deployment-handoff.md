@@ -4,40 +4,49 @@
 
 Implemented and verified:
 
+- GitHub repo pushed: `frankiepan501-a11y/amazon-ops-dashboard`
+- Zeabur service deployed:
+  - Project: `n8n-aments` / `69856f0c2e156a6efa59a9a9`
+  - Service: `amazon-ops-dashboard` / `6a56fc3cb0e767d928f28ba9`
+  - Domain: `https://amazon-ops-dashboard.zeabur.app`
+  - Deployed commit: `89a4872`
 - Feishu Base created: `Ol0ubJol8a6OlKsAhc9cEKngnBe`
 - Tables created:
   - `负责人日汇总`: `tblns68SBBMRmweX`
   - `待处理事项`: `tblSLfuQnYxoFYzn`
   - `数据源健康`: `tblqIkbjVZBZGCV2`
 - Dashboard created: `blkilOFJalDRBEMv`
-- First commit completed:
+- Latest cloud commit verification on 2026-07-15:
   - 7 summary rows
-  - 2589 action rows
-  - 5 source-health rows
+  - 2448 action rows
+  - 6 source-health rows
+  - write result: `summary updated=7`, `actions updated=2448`, `health updated=6`
 - n8n workflow created:
   - ID: `3UVUiybjy4afjQDC`
   - Name: `AMZ - 亚马逊运营日看板刷新`
-  - Active: `false`
+  - Active: `true`
+  - Schedule: 09:40 + 13:30 BJ
+  - `activeVersionId`: `be169eb3-8730-4d2d-b7a1-1ec9046581b9`
 
-## Zeabur Blocker
+## Deployed Configuration
 
-The local environment has `ZEABUR_API_KEY`, but it does not have GitHub CLI or a
-GitHub token. Creating a new Zeabur Git service requires a pushed GitHub repo.
+Zeabur service env:
 
-Minimum next deployment step:
+- `FEISHU_BITABLE_APP_ID`
+- `FEISHU_BITABLE_APP_SECRET`
+- `DASHBOARD_API_TOKEN`
 
-1. Push this directory to a GitHub repo named `amazon-ops-dashboard`.
-2. Create a Zeabur Git service in project `n8n-aments`.
-3. Set environment variables:
-   - `FEISHU_BITABLE_APP_ID`
-   - `FEISHU_BITABLE_APP_SECRET`
-   - `DASHBOARD_API_TOKEN`
-   - `SEARCH_TERM_SUMMARY_URL` when the search-term v2 endpoint is ready
-   - `SEARCH_TERM_API_TOKEN` if that endpoint requires auth
-4. Add generated domain `amazon-ops-dashboard.zeabur.app` or update n8n env
-   `AMAZON_OPS_DASHBOARD_URL`.
-5. Set n8n env `AMAZON_OPS_DASHBOARD_TOKEN`.
-6. Activate workflow `3UVUiybjy4afjQDC`.
+n8n service env:
+
+- `AMAZON_OPS_DASHBOARD_URL=https://amazon-ops-dashboard.zeabur.app`
+- `AMAZON_OPS_DASHBOARD_TOKEN` matches the dashboard service bearer token
+
+Not yet configured:
+
+- `SEARCH_TERM_SUMMARY_URL`
+- `SEARCH_TERM_API_TOKEN`
+- `AMZ_REVIEW_AUDIT_SUMMARY_URL`
+- `AMZ_REVIEW_AUDIT_API_TOKEN`
 
 ## Verification Commands
 
@@ -46,13 +55,27 @@ python -m amazon_ops_dashboard.run_once --mode dry_run
 python -m amazon_ops_dashboard.run_once --mode commit
 ```
 
-Expected health after current local run:
+Cloud verification:
 
-- `A31`: normal
+```bash
+GET  https://amazon-ops-dashboard.zeabur.app/dashboard/health
+POST https://amazon-ops-dashboard.zeabur.app/dashboard/run?mode=commit
+```
+
+Expected health after 2026-07-15 cloud run:
+
+- `A31`: stale/overdue according to source freshness
 - `Rank`: normal
 - `搜索词v2`: error until `SEARCH_TERM_SUMMARY_URL` is configured
-- `展示份额`: stale because the latest completed report is 76 days old
-- `万词作战台`: normal
+- `展示份额`: stale because the latest completed report is 85 days old
+- `万词作战台`: stale because the latest weekly snapshot is over 7 days old
+- `差评审计`: not connected until the customer-service summary endpoint is configured
+
+Implementation note:
+
+- Writes are filtered to the destination Bitable table's actual field list before
+  upsert. This prevents optional future metrics, such as review-audit fields, from
+  blocking today's core dashboard writes when those columns have not been created.
 
 ## 2026-07-06 Dashboard V1.1 View Audit Update
 
