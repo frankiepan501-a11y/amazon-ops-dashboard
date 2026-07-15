@@ -9,7 +9,7 @@ Implemented and verified:
   - Project: `n8n-aments` / `69856f0c2e156a6efa59a9a9`
   - Service: `amazon-ops-dashboard` / `6a56fc3cb0e767d928f28ba9`
   - Domain: `https://amazon-ops-dashboard.zeabur.app`
-  - Verified code commit: `89a4872` (later doc-only commits do not change runtime behavior)
+  - Verified code commit: `beb2fb3`
 - Feishu Base created: `Ol0ubJol8a6OlKsAhc9cEKngnBe`
 - Tables created:
   - `负责人日汇总`: `tblns68SBBMRmweX`
@@ -34,6 +34,8 @@ Implemented and verified:
     workload, and a detail pool.
   - The Feishu Base remains the source-of-truth/detail layer; the web page is
     the management presentation layer.
+  - Latest production API check: `human_open=2448`, `p0=986`, `p1=1442`,
+    `abnormal_sources=5`, `modules=6`, `health=6`, `owners=8`.
 
 ## Deployed Configuration
 
