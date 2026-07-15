@@ -25,6 +25,8 @@ operators.
 ```text
 GET  /
 GET  /api/dashboard
+GET  /wanci
+GET  /api/wanci
 GET  /dashboard/health
 POST /dashboard/run?mode=dry_run
 POST /dashboard/run?mode=commit
@@ -33,6 +35,11 @@ POST /dashboard/run?mode=commit
 `GET /` is the operator-facing dashboard. It reads the Feishu Base rows through
 `GET /api/dashboard` and reorganizes them into summary KPIs, business modules,
 priority actions, source health, owner workload, and a detail pool.
+
+`GET /wanci` is the dedicated Wanci plan workspace. It reads the Wanci weekly
+snapshot source table plus the dashboard action table through `GET /api/wanci`,
+groups rows by site/ASIN/product/owner, and shows task progress, listing
+changes, related todos, and source-record links.
 
 If `DASHBOARD_API_TOKEN` is set, `POST /dashboard/run` requires:
 

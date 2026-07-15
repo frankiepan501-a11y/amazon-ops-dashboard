@@ -32,6 +32,10 @@ Implemented and verified:
   - `GET /api/dashboard` reads the three Feishu dashboard tables and reorganizes
     rows into KPIs, business modules, priority actions, source health, owner
     workload, and a detail pool.
+  - `GET /wanci` is a dedicated Wanci plan workspace. It reads the Wanci weekly
+    snapshot source table and the dashboard action table via `GET /api/wanci`,
+    then shows plan progress, listing changes, open/completed todos, owner
+    progress, and source-record drill-downs.
   - The Feishu Base remains the source-of-truth/detail layer; the web page is
     the management presentation layer.
   - Latest production API check: `human_open=2448`, `p0=986`, `p1=1442`,

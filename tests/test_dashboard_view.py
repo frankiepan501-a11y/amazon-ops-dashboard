@@ -1,7 +1,7 @@
 import unittest
 
 from amazon_ops_dashboard.config import Config
-from amazon_ops_dashboard.dashboard_view import build_dashboard_payload
+from amazon_ops_dashboard.dashboard_view import build_dashboard_payload, build_wanci_payload
 
 
 class _FakeLark:
@@ -75,6 +75,75 @@ class DashboardViewTest(unittest.TestCase):
         self.assertEqual(1, len(payload["priority_actions"]))
         self.assertEqual(1, len(payload["monitor_actions"]))
         self.assertEqual("Rank", payload["priority_actions"][0]["source"])
+
+    def test_wanci_payload_groups_snapshots_and_related_todos(self):
+        cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
+        fake = _FakeLark({
+            cfg.wanci_weekly.table_id: [
+                {
+                    "record_id": "wanci1",
+                    "fields": {
+                        "快照时间": "2026-07-14",
+                        "负责运营": "林明坚",
+                        "站点": "US",
+                        "ASIN": "B0WANCITest",
+                        "产品": "测试手柄",
+                        "失职": "否",
+                        "预算耗尽": 2,
+                        "有rank追踪": "否",
+                        "listing状态": "异常",
+                        "收录Δ": -3,
+                        "首页Δ": 1,
+                    },
+                },
+                {
+                    "record_id": "wanci0",
+                    "fields": {
+                        "快照时间": "2026-07-07",
+                        "负责运营": "林明坚",
+                        "站点": "US",
+                        "ASIN": "B0WANCITest",
+                        "产品": "测试手柄",
+                        "有rank追踪": "是",
+                        "listing状态": "正常",
+                        "收录Δ": 2,
+                        "首页Δ": 0,
+                    },
+                },
+            ],
+            cfg.action_table_id: [
+                {
+                    "record_id": "act1",
+                    "fields": {
+                        "事项键": "Wanci:wanci1:预算耗尽",
+                        "来源": "万词作战台",
+                        "负责人": "林明坚",
+                        "严重级别": "P1",
+                        "状态": "待处理",
+                        "站点": "US",
+                        "ASIN": "B0WANCITest",
+                        "产品": "测试手柄",
+                        "指标": "预算耗尽",
+                        "当前值": "2",
+                        "源记录ID": "wanci1",
+                    },
+                }
+            ],
+            cfg.health_table_id: [],
+            cfg.summary_table_id: [],
+        })
+
+        payload = build_wanci_payload(cfg, fake)
+
+        self.assertEqual(1, payload["summary"]["plans"])
+        self.assertEqual(1, payload["summary"]["todo_open"])
+        self.assertEqual(1, payload["summary"]["listing_abnormal"])
+        self.assertEqual(1, payload["summary"]["no_rank_tracking"])
+        plan = payload["plans"][0]
+        self.assertEqual("待处理", plan["stage"])
+        self.assertEqual(2, len(plan["history"]))
+        self.assertEqual(1, len(plan["open_actions"]))
+        self.assertIn("未建 Rank 追踪", plan["issues"])
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 
 from .aggregator import Aggregator
 from .config import Config
-from .dashboard_view import INDEX_HTML, build_dashboard_payload
+from .dashboard_view import INDEX_HTML, WANCI_HTML, build_dashboard_payload, build_wanci_payload
 from .lark_client import LarkClient
 
 
@@ -20,6 +20,18 @@ def dashboard() -> dict:
     cfg = Config()
     cfg.validate()
     return build_dashboard_payload(cfg, LarkClient(cfg.feishu_app_id, cfg.feishu_app_secret))
+
+
+@app.get("/wanci", response_class=HTMLResponse)
+def wanci() -> str:
+    return WANCI_HTML
+
+
+@app.get("/api/wanci")
+def wanci_data() -> dict:
+    cfg = Config()
+    cfg.validate()
+    return build_wanci_payload(cfg, LarkClient(cfg.feishu_app_id, cfg.feishu_app_secret))
 
 
 def build_aggregator() -> Aggregator:

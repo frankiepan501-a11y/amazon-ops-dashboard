@@ -18,9 +18,17 @@ MODULES = [
     {
         "key": "listing",
         "title": "Listing 体检",
-        "subtitle": "先修上架质量，再谈广告和排名",
-        "sources": ["A31", "万词作战台"],
+        "subtitle": "A31 告警、上架质量和基础异常",
+        "sources": ["A31"],
         "owner_hint": "运营负责人",
+    },
+    {
+        "key": "wanci",
+        "title": "万词计划",
+        "subtitle": "埋词、收录、首页、广告承接、Rank 追踪",
+        "sources": ["万词作战台"],
+        "owner_hint": "项目运营",
+        "href": "/wanci",
     },
     {
         "key": "rank",
@@ -105,6 +113,189 @@ def build_dashboard_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
         "owners": owners,
         "summary": summary,
     }
+
+
+def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
+    source_records = [
+        normalize_wanci_record(rec, cfg)
+        for rec in lark.list_records(cfg.wanci_weekly.app_token, cfg.wanci_weekly.table_id, cfg.max_records_per_source)
+    ]
+    source_records = [x for x in source_records if x["group_key"]]
+    action_records = [
+        normalize_action_record(rec)
+        for rec in lark.list_records(cfg.dashboard_base_token, cfg.action_table_id, 10000)
+    ]
+    wanci_actions = [x for x in action_records if x["source"] == "万词作战台"]
+    actions_by_record: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for action in wanci_actions:
+        if action["source_record_id"]:
+            actions_by_record[action["source_record_id"]].append(action)
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in source_records:
+        group = grouped.setdefault(item["group_key"], {"latest": None, "history": [], "record_ids": set()})
+        group["history"].append(item)
+        group["record_ids"].add(item["record_id"])
+        latest = group["latest"]
+        if latest is None or item["snapshot_ms"] > latest["snapshot_ms"]:
+            group["latest"] = item
+
+    plans = []
+    for group in grouped.values():
+        latest = group["latest"]
+        history = sorted(group["history"], key=lambda x: x["snapshot_ms"], reverse=True)
+        related = []
+        for rid in group["record_ids"]:
+            related.extend(actions_by_record.get(rid, []))
+        if not related:
+            related = [
+                action for action in wanci_actions
+                if action["asin"] == latest["asin"]
+                and action["site"] == latest["site"]
+                and action["owner"] == latest["owner"]
+            ]
+        related = dedupe_actions(related)
+        open_actions = [x for x in related if needs_human(x)]
+        completed_actions = [x for x in related if is_done(x) or x["status"] in NO_ACTION_STATUSES]
+        flags = wanci_issue_flags(latest)
+        issue_count = max(len(flags), len(related))
+        if not flags and not open_actions:
+            progress = 100
+            stage = "观察中"
+        elif open_actions:
+            done = len(completed_actions)
+            total = max(issue_count, done + len(open_actions), 1)
+            progress = max(15, min(95, int(done / total * 100)))
+            stage = "待处理"
+        else:
+            progress = 85
+            stage = "待确认"
+        plans.append({
+            **latest,
+            "stage": stage,
+            "progress": progress,
+            "issues": flags,
+            "open_actions": sort_actions(open_actions),
+            "completed_actions": completed_actions,
+            "todo_open": len(open_actions),
+            "todo_done": len(completed_actions),
+            "todo_total": len(related),
+            "history": history[:8],
+        })
+
+    plans = sorted(plans, key=lambda x: (
+        0 if x["stage"] == "待处理" else 1 if x["stage"] == "待确认" else 2,
+        -(x["todo_open"] * 100 + len(x["issues"]) * 10),
+        x["owner"],
+        x["site"],
+        x["asin"],
+    ))
+    owner_rows = build_wanci_owner_rows(plans)
+    return {
+        "generated_at_ms": now_ms(),
+        "feishu_base_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.dashboard_base_token}",
+        "source_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_weekly.app_token}?table={cfg.wanci_weekly.table_id}",
+        "summary": {
+            "plans": len(plans),
+            "todo_open": sum(x["todo_open"] for x in plans),
+            "todo_done": sum(x["todo_done"] for x in plans),
+            "listing_abnormal": sum(1 for x in plans if x["listing_status"] not in ("", "正常")),
+            "budget_exhausted": sum(1 for x in plans if x["budget_exhausted"] > 0),
+            "no_rank_tracking": sum(1 for x in plans if x["rank_tracking"] == "否"),
+            "stale_snapshots": sum(1 for x in plans if x["age_days"] > 10),
+        },
+        "owners": owner_rows,
+        "plans": plans,
+    }
+
+
+def normalize_wanci_record(rec: dict[str, Any], cfg: Config) -> dict[str, Any]:
+    f = rec.get("fields") or {}
+    record_id = rec.get("record_id", "")
+    snapshot_ms = parse_time_value(f.get("快照时间"))
+    site = text_value(f.get("站点")) or text_value(f.get("区域"))
+    asin = text_value(f.get("ASIN"))
+    product = text_value(f.get("产品"))
+    owner = text_value(f.get("负责运营")) or "未分配"
+    group_key = "|".join([site, asin, product, owner]).strip("|") or record_id
+    include_delta = int_value(f.get("收录Δ"))
+    page_delta = int_value(f.get("首页Δ"))
+    budget = int_value(f.get("预算耗尽"))
+    listing_status = text_value(f.get("listing状态")) or "正常"
+    return {
+        "record_id": record_id,
+        "group_key": group_key,
+        "snapshot_ms": snapshot_ms,
+        "snapshot": date_text(snapshot_ms),
+        "age_days": age_days_from_ms(snapshot_ms),
+        "owner": owner,
+        "site": site,
+        "asin": asin,
+        "product": product,
+        "failure": text_value(f.get("失职")),
+        "budget_exhausted": budget,
+        "rank_tracking": text_value(f.get("有rank追踪")),
+        "listing_status": listing_status,
+        "include_delta": include_delta,
+        "page_delta": page_delta,
+        "source_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_weekly.app_token}?table={cfg.wanci_weekly.table_id}&record={record_id}",
+    }
+
+
+def wanci_issue_flags(item: dict[str, Any]) -> list[str]:
+    flags = []
+    if truthy_text(item["failure"]):
+        flags.append("存在失职项")
+    if item["budget_exhausted"] > 0:
+        flags.append(f"预算耗尽 {item['budget_exhausted']} 个")
+    if item["rank_tracking"] == "否":
+        flags.append("未建 Rank 追踪")
+    if item["listing_status"] not in ("", "正常"):
+        flags.append(f"Listing 状态：{item['listing_status']}")
+    if item["include_delta"] < 0:
+        flags.append(f"收录下降 {item['include_delta']}")
+    if item["page_delta"] < 0:
+        flags.append(f"首页下降 {item['page_delta']}")
+    if item["age_days"] > 10:
+        flags.append(f"快照 {item['age_days']} 天未更新")
+    return flags
+
+
+def dedupe_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    seen = set()
+    for action in actions:
+        key = action["key"] or action["record_id"]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(action)
+    return out
+
+
+def build_wanci_owner_rows(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "owner": "",
+        "plans": 0,
+        "todo_open": 0,
+        "todo_done": 0,
+        "listing_abnormal": 0,
+        "avg_progress": 0,
+    })
+    for plan in plans:
+        row = rows[plan["owner"]]
+        row["owner"] = plan["owner"]
+        row["plans"] += 1
+        row["todo_open"] += plan["todo_open"]
+        row["todo_done"] += plan["todo_done"]
+        row["listing_abnormal"] += 1 if plan["listing_status"] not in ("", "正常") else 0
+        row["avg_progress"] += plan["progress"]
+    out = []
+    for row in rows.values():
+        if row["plans"]:
+            row["avg_progress"] = int(row["avg_progress"] / row["plans"])
+        out.append(row)
+    return sorted(out, key=lambda x: (-(x["todo_open"] * 100 + x["listing_abnormal"] * 10), x["owner"]))
 
 
 def now_ms() -> int:
@@ -223,6 +414,7 @@ def build_modules(actions: list[dict[str, Any]], human_actions: list[dict[str, A
             "subtitle": module["subtitle"],
             "sources": module["sources"],
             "owner_hint": module["owner_hint"],
+            "href": module.get("href", ""),
             "health": worst,
             "health_text": health_label(worst),
             "human_open": len(module_human),
@@ -290,6 +482,37 @@ def int_value(value: Any) -> int:
         return int(float(text))
     except ValueError:
         return 0
+
+
+def parse_time_value(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    if isinstance(value, (int, float)):
+        n = int(value)
+        return n * 1000 if n and n < 10000000000 else n
+    text = normalize_cell(value).strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        n = int(text)
+        return n * 1000 if n and n < 10000000000 else n
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return int(datetime.strptime(text, fmt).replace(tzinfo=BJ).timestamp() * 1000)
+        except ValueError:
+            pass
+    return 0
+
+
+def age_days_from_ms(ms: int) -> int:
+    if not ms:
+        return 999
+    return max(0, int((now_ms() - ms) / 86400000))
+
+
+def truthy_text(value: Any) -> bool:
+    text = normalize_cell(value).strip().lower()
+    return text not in ("", "0", "false", "否", "无", "正常", "no", "none", "null")
 
 
 def link_value(value: Any) -> str:
@@ -474,6 +697,13 @@ INDEX_HTML = """<!doctype html>
     .module.todo { border-left-color: var(--violet); }
     .module-title { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
     .module-title strong { font-size: 17px; }
+    .module-link {
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 900;
+      text-decoration: none;
+      width: fit-content;
+    }
     .tag {
       display: inline-flex;
       align-items: center;
@@ -571,11 +801,10 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <nav>
-        <a href="#overview" class="active">总览</a>
-        <a href="#modules">业务模块</a>
+        <a href="/" class="active">总览</a>
+        <a href="/wanci">万词计划</a>
         <a href="#priority">今日待办</a>
         <a href="#health">数据健康</a>
-        <a href="#owners">负责人</a>
         <a href="#details">明细池</a>
       </nav>
       <div class="source-card">
@@ -785,6 +1014,7 @@ INDEX_HTML = """<!doctype html>
               ${tag(m.health_text, cls)}
             </div>
             <div class="hint">来源：${esc(m.sources.join(" / "))}</div>
+            ${m.href ? `<a class="module-link" href="${esc(m.href)}">进入${esc(m.title)}工作台</a>` : ""}
             <div class="module-meta">
               <div class="mini"><span>待人工</span><strong>${nf.format(m.human_open)}</strong></div>
               <div class="mini"><span>P0/P1</span><strong>${nf.format(m.p0)}/${nf.format(m.p1)}</strong></div>
@@ -932,6 +1162,455 @@ INDEX_HTML = """<!doctype html>
     });
 
     loadDashboard();
+  </script>
+</body>
+</html>"""
+
+
+WANCI_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>万词计划工作台</title>
+  <style>
+    :root {
+      --paper: #f4f1ea;
+      --surface: #fffdf7;
+      --ink: #171914;
+      --muted: #6a6d60;
+      --line: #d8d0c2;
+      --green: #166b52;
+      --red: #b13d35;
+      --amber: #b06f16;
+      --blue: #285d91;
+      --violet: #6f568c;
+      --shadow: 0 18px 42px rgba(37, 32, 24, .08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 1180px;
+      color: var(--ink);
+      font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      letter-spacing: 0;
+      background:
+        linear-gradient(90deg, rgba(23,25,20,.035) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(23,25,20,.03) 1px, transparent 1px),
+        var(--paper);
+      background-size: 28px 28px;
+    }
+    .app { display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 18px 14px;
+      background: #1c211b;
+      color: #f8f3e8;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #0c0f0b;
+    }
+    .brand { display: flex; gap: 10px; align-items: center; margin-bottom: 28px; }
+    .mark {
+      width: 38px; height: 38px; display: grid; place-items: center;
+      border: 1px solid rgba(248,243,232,.28); color: #40e0b9; font-weight: 900; font-size: 13px;
+    }
+    .brand strong { display: block; font-size: 14px; }
+    .brand span { display: block; color: rgba(248,243,232,.62); font-size: 11px; margin-top: 3px; }
+    nav { display: grid; gap: 6px; }
+    nav a {
+      color: rgba(248,243,232,.84); text-decoration: none; min-height: 35px;
+      display: flex; align-items: center; padding: 0 10px; border-radius: 5px; font-size: 13px;
+    }
+    nav a:hover, nav a.active { background: #2a3028; color: #fff; }
+    .source-card {
+      margin-top: auto; padding: 13px; border: 1px solid rgba(248,243,232,.14);
+      border-radius: 8px; background: #11150f; line-height: 1.65; font-size: 12px; color: rgba(248,243,232,.78);
+    }
+    .source-card strong { display: block; color: #fff; margin: 4px 0; }
+    main { padding: 28px 32px 54px; min-width: 0; }
+    .topbar { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 18px; }
+    .eyebrow { color: var(--green); font-weight: 900; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    h1 { margin: 3px 0 8px; font-size: 42px; line-height: 1.05; font-weight: 950; }
+    .subtitle { max-width: 940px; color: var(--muted); font-size: 13px; line-height: 1.75; }
+    .actions { display: flex; gap: 9px; align-items: center; justify-content: flex-end; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+    .button, button {
+      height: 34px; border: 1px solid var(--ink); border-radius: 5px; padding: 0 12px;
+      background: var(--ink); color: #fffdf7; font-weight: 800; cursor: pointer; text-decoration: none;
+      display: inline-flex; align-items: center; justify-content: center; font-family: inherit; font-size: 13px;
+    }
+    .button.secondary, button.secondary { background: var(--surface); color: var(--ink); border-color: var(--line); }
+    .kpis { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .card, .panel {
+      background: rgba(255,253,247,.9); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow);
+    }
+    .kpi { min-height: 96px; padding: 13px; position: relative; overflow: hidden; }
+    .kpi::after {
+      content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
+      background: linear-gradient(90deg, var(--green), var(--amber), var(--violet));
+    }
+    .label { color: var(--muted); font-size: 12px; font-weight: 800; }
+    .value { margin-top: 10px; font-size: 28px; line-height: 1; font-weight: 950; font-variant-numeric: tabular-nums; }
+    .delta { margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .danger .value { color: var(--red); }
+    .warn .value { color: var(--amber); }
+    .ok .value { color: var(--green); }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(420px, .85fr); gap: 12px; align-items: start; }
+    .panel { padding: 14px; overflow: hidden; }
+    .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 11px; padding-bottom: 9px; border-bottom: 1px solid #ece4d6; }
+    .panel h2, .panel h3 { margin: 0; font-size: 17px; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .filters { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    select, input {
+      width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 5px;
+      padding: 0 10px; background: rgba(255,253,247,.92); color: var(--ink); font-family: inherit;
+    }
+    .task-list { display: grid; gap: 9px; max-height: 720px; overflow: auto; padding-right: 4px; }
+    .task {
+      text-align: left; height: auto; color: var(--ink); background: #fffaf0; border: 1px solid #e7dccb;
+      border-left: 4px solid var(--green); border-radius: 8px; padding: 12px; display: block; cursor: pointer;
+    }
+    .task:hover, .task.active { border-left-color: var(--amber); background: #fff6e6; }
+    .task.bad { border-left-color: var(--red); }
+    .task.warn { border-left-color: var(--amber); }
+    .task-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 8px; }
+    .task-title { font-weight: 900; font-size: 14px; overflow-wrap: anywhere; }
+    .task-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .tag {
+      display: inline-flex; align-items: center; min-height: 23px; padding: 0 8px; border-radius: 999px;
+      border: 1px solid var(--line); background: #f6efe2; color: #40463e; white-space: nowrap; font-size: 12px; font-weight: 800;
+    }
+    .tag.bad { color: var(--red); border-color: rgba(177,61,53,.34); background: rgba(177,61,53,.08); }
+    .tag.warn { color: var(--amber); border-color: rgba(176,111,22,.35); background: rgba(176,111,22,.09); }
+    .tag.ok { color: var(--green); border-color: rgba(22,107,82,.35); background: rgba(22,107,82,.08); }
+    .progress { margin-top: 9px; height: 9px; border-radius: 999px; background: #e7dfd1; overflow: hidden; }
+    .progress span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--green), var(--blue)); min-width: 2px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+    .mini { padding: 9px; background: #fffaf0; border: 1px solid #eadfcd; border-radius: 7px; }
+    .mini span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+    .mini strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+    .timeline, .todo-list, .owner-list { display: grid; gap: 8px; }
+    .row {
+      display: grid; grid-template-columns: 112px minmax(0, 1fr) 110px; gap: 10px;
+      align-items: start; padding: 9px 0; border-bottom: 1px solid #eee5d8; font-size: 12px;
+    }
+    .row:last-child { border-bottom: 0; }
+    .todo {
+      padding: 10px; border: 1px solid #e7dccb; border-radius: 7px; background: #fffaf0; font-size: 12px; line-height: 1.65;
+    }
+    .todo strong { display: block; font-size: 13px; margin-bottom: 4px; }
+    .todo a, .source-link { color: var(--green); font-weight: 900; text-decoration: none; }
+    .owner-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) 120px; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid #eee5d8; font-size: 12px; }
+    .track { height: 9px; background: #e7dfd1; border-radius: 999px; overflow: hidden; }
+    .fill { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--green), var(--blue)); min-width: 2px; }
+    .empty, .loading { color: var(--muted); padding: 20px; border: 1px dashed var(--line); border-radius: 8px; background: rgba(255,253,247,.62); }
+    .error { color: var(--red); background: rgba(177,61,53,.08); border: 1px solid rgba(177,61,53,.25); border-radius: 8px; padding: 16px; }
+    @media (max-width: 1360px) {
+      .kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .layout { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 980px) {
+      body { min-width: 0; }
+      .app { grid-template-columns: 1fr; }
+      .sidebar { position: relative; height: auto; }
+      main { padding: 18px 14px 42px; }
+      .kpis, .detail-grid { grid-template-columns: 1fr; }
+      .filters { grid-template-columns: 1fr; }
+      h1 { font-size: 30px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark">AMZ</div>
+        <div>
+          <strong>Amazon Ops</strong>
+          <span>万词计划工作台</span>
+        </div>
+      </div>
+      <nav>
+        <a href="/">总览</a>
+        <a href="/wanci" class="active">万词计划</a>
+        <a href="#tasks">任务台</a>
+        <a href="#detail">Listing变化</a>
+        <a href="#owners">负责人进度</a>
+      </nav>
+      <div class="source-card">
+        <div>数据源</div>
+        <strong>万词作战台周快照</strong>
+        <div>页面只读；处理动作仍回源记录或待办源表。</div>
+        <div id="sideStatus">正在读取数据...</div>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">Wanci Plan Operations</div>
+          <h1>万词计划工作台</h1>
+          <div class="subtitle">把万词计划从首页拆出来，按 ASIN/站点/产品展示跟进进度、Listing 变化、Rank 追踪、预算耗尽和待办完成情况。</div>
+        </div>
+        <div class="actions">
+          <span id="refreshText">未刷新</span>
+          <button class="secondary" onclick="loadWanci()">刷新页面数据</button>
+          <a class="button secondary" id="sourceLink" href="#">打开万词源表</a>
+        </div>
+      </header>
+      <section id="kpis" class="kpis"><div class="loading">正在加载万词计划...</div></section>
+      <section class="layout" id="tasks">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>万词任务台</h2>
+            <span class="hint">点击任一任务，右侧展示 Listing 变化和待办进度。</span>
+          </div>
+          <div class="filters">
+            <input id="searchInput" placeholder="搜索负责人 / ASIN / 产品 / 站点" />
+            <select id="ownerFilter"></select>
+            <select id="stageFilter">
+              <option value="">全部阶段</option>
+              <option value="待处理">待处理</option>
+              <option value="待确认">待确认</option>
+              <option value="观察中">观察中</option>
+            </select>
+            <select id="issueFilter">
+              <option value="">全部问题</option>
+              <option value="listing">Listing异常</option>
+              <option value="rank">未建Rank追踪</option>
+              <option value="budget">预算耗尽</option>
+              <option value="stale">快照过期</option>
+            </select>
+          </div>
+          <div id="taskList" class="task-list"></div>
+        </div>
+        <div class="panel" id="detail">
+          <div class="panel-head">
+            <h2>Listing 变化与待办</h2>
+            <span class="hint">默认展示最需要处理的一条。</span>
+          </div>
+          <div id="detailPane" class="empty">请选择左侧任务。</div>
+        </div>
+      </section>
+      <section class="panel" id="owners" style="margin-top:12px;">
+        <div class="panel-head">
+          <h2>负责人进度</h2>
+          <span class="hint">按未完成待办和 Listing 异常排序。</span>
+        </div>
+        <div id="ownerRows" class="owner-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const state = { data: null, selected: null };
+    const nf = new Intl.NumberFormat("zh-CN");
+    const $ = (id) => document.getElementById(id);
+
+    function esc(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function tag(value, cls = "") {
+      return `<span class="tag ${cls}">${esc(value || "无")}</span>`;
+    }
+
+    function issueClass(plan) {
+      if (plan.stage === "待处理") return "bad";
+      if (plan.stage === "待确认") return "warn";
+      return "";
+    }
+
+    async function loadWanci() {
+      $("refreshText").textContent = "刷新中...";
+      try {
+        const res = await fetch("/api/wanci", { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+        state.data = data;
+        state.selected = data.plans[0]?.group_key || null;
+        $("sourceLink").href = data.source_url;
+        $("sideStatus").textContent = `${nf.format(data.summary.plans)} 个计划，${nf.format(data.summary.todo_open)} 个待办`;
+        $("refreshText").textContent = `已刷新 ${new Date(data.generated_at_ms).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+        render();
+      } catch (err) {
+        $("kpis").innerHTML = `<div class="error">万词计划加载失败：${esc(err.message)}</div>`;
+        $("refreshText").textContent = "刷新失败";
+      }
+    }
+
+    function render() {
+      renderKpis();
+      renderFilters();
+      renderTasks();
+      renderDetail();
+      renderOwners();
+      bindFilters();
+    }
+
+    function renderKpis() {
+      const s = state.data.summary;
+      const cards = [
+        ["计划数", s.plans, "按 ASIN/站点/负责人聚合", ""],
+        ["未完成待办", s.todo_open, "需要运营继续处理", s.todo_open ? "danger" : "ok"],
+        ["已完成/关闭", s.todo_done, "来自待办状态", "ok"],
+        ["Listing异常", s.listing_abnormal, "listing状态非正常", s.listing_abnormal ? "warn" : "ok"],
+        ["预算耗尽", s.budget_exhausted, "需要广告预算判断", s.budget_exhausted ? "warn" : ""],
+        ["未建Rank追踪", s.no_rank_tracking, "会影响后续复盘", s.no_rank_tracking ? "warn" : "ok"],
+        ["快照过期", s.stale_snapshots, "超过 10 天未更新", s.stale_snapshots ? "warn" : "ok"],
+      ];
+      $("kpis").innerHTML = cards.map(([label, value, hint, cls]) => `
+        <article class="card kpi ${cls}">
+          <div class="label">${esc(label)}</div>
+          <div class="value">${esc(value)}</div>
+          <div class="delta">${esc(hint)}</div>
+        </article>
+      `).join("");
+    }
+
+    function renderFilters() {
+      const owners = [...new Set(state.data.plans.map((x) => x.owner).filter(Boolean))].sort();
+      const current = $("ownerFilter").value || "";
+      $("ownerFilter").innerHTML = `<option value="">全部负责人</option>` + owners.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
+      $("ownerFilter").value = current;
+    }
+
+    function filteredPlans() {
+      const q = $("searchInput")?.value?.trim().toLowerCase() || "";
+      const owner = $("ownerFilter")?.value || "";
+      const stage = $("stageFilter")?.value || "";
+      const issue = $("issueFilter")?.value || "";
+      return state.data.plans.filter((p) => {
+        const hay = [p.owner, p.site, p.asin, p.product, p.stage, p.issues.join(" ")].join(" ").toLowerCase();
+        if (q && !hay.includes(q)) return false;
+        if (owner && p.owner !== owner) return false;
+        if (stage && p.stage !== stage) return false;
+        if (issue === "listing" && ["", "正常"].includes(p.listing_status)) return false;
+        if (issue === "rank" && p.rank_tracking !== "否") return false;
+        if (issue === "budget" && !p.budget_exhausted) return false;
+        if (issue === "stale" && p.age_days <= 10) return false;
+        return true;
+      });
+    }
+
+    function renderTasks() {
+      const rows = filteredPlans();
+      if (!rows.length) {
+        $("taskList").innerHTML = `<div class="empty">没有匹配的万词计划。</div>`;
+        return;
+      }
+      if (!rows.some((x) => x.group_key === state.selected)) state.selected = rows[0].group_key;
+      $("taskList").innerHTML = rows.map((p) => `
+        <button type="button" class="task ${issueClass(p)} ${p.group_key === state.selected ? "active" : ""}" data-key="${esc(p.group_key)}">
+          <div class="task-head">
+            <div>
+              <div class="task-title">${esc(p.product || p.asin || "未命名计划")}</div>
+              <div class="hint">${esc(p.site || "无站点")} · ${esc(p.asin || "无ASIN")} · ${esc(p.owner)}</div>
+            </div>
+            ${tag(p.stage, p.stage === "待处理" ? "bad" : p.stage === "待确认" ? "warn" : "ok")}
+          </div>
+          <div class="progress"><span style="width:${Math.max(3, p.progress)}%"></span></div>
+          <div class="task-meta">
+            ${tag(`进度 ${p.progress}%`)}
+            ${tag(`待办 ${p.todo_done}/${p.todo_total}`)}
+            ${tag(`Listing ${p.listing_status || "正常"}`, p.listing_status && p.listing_status !== "正常" ? "warn" : "ok")}
+            ${p.rank_tracking === "否" ? tag("未建Rank", "warn") : ""}
+          </div>
+        </button>
+      `).join("");
+      document.querySelectorAll(".task").forEach((node) => {
+        node.addEventListener("click", () => {
+          state.selected = node.dataset.key;
+          renderTasks();
+          renderDetail();
+        });
+      });
+    }
+
+    function selectedPlan() {
+      return state.data.plans.find((x) => x.group_key === state.selected) || state.data.plans[0];
+    }
+
+    function renderDetail() {
+      const p = selectedPlan();
+      if (!p) {
+        $("detailPane").innerHTML = `<div class="empty">暂无万词计划。</div>`;
+        return;
+      }
+      $("detailPane").innerHTML = `
+        <div class="detail-grid">
+          <div class="mini"><span>阶段</span><strong>${esc(p.stage)}</strong></div>
+          <div class="mini"><span>跟进进度</span><strong>${esc(p.progress)}%</strong></div>
+          <div class="mini"><span>待办完成</span><strong>${esc(p.todo_done)}/${esc(p.todo_total)}</strong></div>
+          <div class="mini"><span>收录变化</span><strong>${esc(p.include_delta)}</strong></div>
+          <div class="mini"><span>首页变化</span><strong>${esc(p.page_delta)}</strong></div>
+          <div class="mini"><span>快照距今</span><strong>${esc(p.age_days)}天</strong></div>
+        </div>
+        <div class="todo-list">
+          <div class="todo">
+            <strong>${esc(p.product || p.asin)}</strong>
+            站点：${esc(p.site || "无")}　ASIN：${esc(p.asin || "无")}　负责人：${esc(p.owner)}<br />
+            Listing状态：${esc(p.listing_status || "正常")}　Rank追踪：${esc(p.rank_tracking || "无")}　预算耗尽：${esc(p.budget_exhausted)}
+            <br /><a class="source-link" href="${esc(p.source_url)}" target="_blank" rel="noreferrer">打开万词源记录</a>
+          </div>
+          ${p.issues.length ? `<div class="todo"><strong>当前问题</strong>${p.issues.map((x) => `<div>${esc(x)}</div>`).join("")}</div>` : `<div class="todo"><strong>当前问题</strong>没有明显异常，保持观察。</div>`}
+          ${renderTodos(p)}
+        </div>
+        <h3 style="margin:16px 0 8px;">Listing 快照变化</h3>
+        <div class="timeline">
+          ${p.history.map((h) => `
+            <div class="row">
+              <strong>${esc(h.snapshot || "无日期")}</strong>
+              <span>Listing：${esc(h.listing_status || "正常")} · Rank追踪：${esc(h.rank_tracking || "无")} · 预算耗尽：${esc(h.budget_exhausted)}</span>
+              <span>收录Δ ${esc(h.include_delta)} / 首页Δ ${esc(h.page_delta)}</span>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
+    function renderTodos(p) {
+      const rows = [...p.open_actions, ...p.completed_actions].slice(0, 12);
+      if (!rows.length) return `<div class="todo"><strong>待办记录</strong>当前没有匹配到聚合待办，按源表快照判断进度。</div>`;
+      return `<div class="todo"><strong>待办记录</strong>${rows.map((a) => `
+        <div style="margin-top:8px;">
+          ${tag(a.severity, a.severity === "P0" ? "bad" : a.severity === "P1" ? "warn" : "")}
+          ${tag(a.status, ["无需处理","已处理","已完成"].includes(a.status) ? "ok" : "")}
+          ${esc(a.metric)}：${esc(a.current_value || "无")}
+          ${a.source_url ? ` · <a href="${esc(a.source_url)}" target="_blank" rel="noreferrer">源记录</a>` : ""}
+        </div>
+      `).join("")}</div>`;
+    }
+
+    function renderOwners() {
+      const max = Math.max(1, ...state.data.owners.map((x) => x.plans));
+      $("ownerRows").innerHTML = state.data.owners.map((o) => `
+        <div class="owner-row">
+          <strong>${esc(o.owner)}</strong>
+          <div class="track"><span class="fill" style="width:${Math.max(3, o.plans / max * 100)}%"></span></div>
+          <span>${nf.format(o.plans)} 计划 · ${nf.format(o.todo_open)} 待办 · ${nf.format(o.avg_progress)}%</span>
+        </div>
+      `).join("");
+    }
+
+    function bindFilters() {
+      ["searchInput", "ownerFilter", "stageFilter", "issueFilter"].forEach((id) => {
+        const el = $(id);
+        if (el && !el.dataset.bound) {
+          el.addEventListener("input", () => { renderTasks(); renderDetail(); });
+          el.addEventListener("change", () => { renderTasks(); renderDetail(); });
+          el.dataset.bound = "1";
+        }
+      });
+    }
+
+    loadWanci();
   </script>
 </body>
 </html>"""
