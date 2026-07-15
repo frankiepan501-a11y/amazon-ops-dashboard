@@ -92,6 +92,22 @@ class LarkClient:
                 return records
             page_token = data.get("page_token", "")
 
+    def list_field_names(self, app_token: str, table_id: str) -> set[str]:
+        names: set[str] = set()
+        page_token = ""
+        while True:
+            params: dict[str, Any] = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            data = self.request("GET", f"/bitable/v1/apps/{app_token}/tables/{table_id}/fields", params=params)
+            for item in data.get("items") or []:
+                name = item.get("field_name")
+                if name:
+                    names.add(str(name))
+            if not data.get("has_more"):
+                return names
+            page_token = data.get("page_token", "")
+
     def batch_create_records(self, app_token: str, table_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not rows:
             return {"created": 0}

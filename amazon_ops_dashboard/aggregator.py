@@ -503,9 +503,9 @@ class Aggregator:
 
     def write(self, result: RunResult) -> dict[str, Any]:
         base = self.cfg.dashboard_base_token
-        action_fields = [x.fields() for x in result.action_items]
-        summary_fields = [x.fields() for x in result.summary_rows]
-        health_fields = [x.fields() for x in result.health_rows]
+        summary_fields = self.fields_for_table(self.cfg.summary_table_id, [x.fields() for x in result.summary_rows])
+        action_fields = self.fields_for_table(self.cfg.action_table_id, [x.fields() for x in result.action_items])
+        health_fields = self.fields_for_table(self.cfg.health_table_id, [x.fields() for x in result.health_rows])
         write_result = {
             "summary": self.lark.upsert_by_key(base, self.cfg.summary_table_id, "汇总键", summary_fields),
             "actions": self.lark.upsert_by_key(base, self.cfg.action_table_id, "事项键", action_fields),
@@ -513,6 +513,10 @@ class Aggregator:
         }
         write_result["stale_actions"] = self.close_missing_actions(action_fields)
         return write_result
+
+    def fields_for_table(self, table_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        allowed = self.lark.list_field_names(self.cfg.dashboard_base_token, table_id)
+        return [{k: v for k, v in row.items() if k in allowed} for row in rows]
 
     def close_missing_actions(self, current_fields: list[dict[str, Any]]) -> dict[str, Any]:
         current_keys = {normalize_cell(x.get("事项键")) for x in current_fields}
