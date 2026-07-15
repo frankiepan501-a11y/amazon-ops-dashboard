@@ -9,7 +9,7 @@ Implemented and verified:
   - Project: `n8n-aments` / `69856f0c2e156a6efa59a9a9`
   - Service: `amazon-ops-dashboard` / `6a56fc3cb0e767d928f28ba9`
   - Domain: `https://amazon-ops-dashboard.zeabur.app`
-  - Deployed commit: `89a4872`
+  - Verified code commit: `89a4872` (later doc-only commits do not change runtime behavior)
 - Feishu Base created: `Ol0ubJol8a6OlKsAhc9cEKngnBe`
 - Tables created:
   - `负责人日汇总`: `tblns68SBBMRmweX`
