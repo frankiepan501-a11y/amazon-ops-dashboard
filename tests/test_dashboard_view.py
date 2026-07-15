@@ -79,6 +79,19 @@ class DashboardViewTest(unittest.TestCase):
     def test_wanci_payload_groups_snapshots_and_related_todos(self):
         cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
         fake = _FakeLark({
+            cfg.wanci_registry.table_id: [
+                {
+                    "record_id": "reg1",
+                    "fields": {
+                        "负责运营": "林明坚",
+                        "站点": "US",
+                        "ASIN": "B0WANCITest",
+                        "产品": "测试手柄",
+                        "状态": "在跑",
+                        "是否每天更新": "会每天更新",
+                    },
+                }
+            ],
             cfg.wanci_weekly.table_id: [
                 {
                     "record_id": "wanci1",
@@ -144,6 +157,77 @@ class DashboardViewTest(unittest.TestCase):
         self.assertEqual(2, len(plan["history"]))
         self.assertEqual(1, len(plan["open_actions"]))
         self.assertIn("未建 Rank 追踪", plan["issues"])
+
+    def test_wanci_registry_rank_overrides_stale_snapshot_rank_status(self):
+        cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
+        fake = _FakeLark({
+            cfg.wanci_registry.table_id: [
+                {
+                    "record_id": "reg1",
+                    "fields": {
+                        "负责运营": "林明坚",
+                        "站点": "DE",
+                        "ASIN": "B0WANCITest",
+                        "产品": "测试手柄",
+                        "状态": "在跑",
+                        "是否每天更新": "会每天更新",
+                        "rank子表id": "tblRank",
+                    },
+                }
+            ],
+            cfg.wanci_weekly.table_id: [
+                {
+                    "record_id": "snap1",
+                    "fields": {
+                        "快照时间": "2026-07-14",
+                        "负责运营": "林明坚",
+                        "站点": "DE",
+                        "ASIN": "B0WANCITest",
+                        "产品": "测试手柄",
+                        "有rank追踪": "否",
+                        "listing状态": "正常",
+                    },
+                }
+            ],
+            cfg.action_table_id: [],
+        })
+
+        payload = build_wanci_payload(cfg, fake)
+
+        self.assertEqual(1, payload["summary"]["plans"])
+        self.assertEqual(1, payload["summary"]["active_plans"])
+        self.assertEqual(0, payload["summary"]["no_rank_tracking"])
+        plan = payload["plans"][0]
+        self.assertEqual("是", plan["rank_tracking"])
+        self.assertNotIn("未建 Rank 追踪", plan["issues"])
+
+    def test_wanci_registry_active_without_snapshot_is_missing_review(self):
+        cfg = Config(feishu_app_id="id", feishu_app_secret="secret")
+        fake = _FakeLark({
+            cfg.wanci_registry.table_id: [
+                {
+                    "record_id": "reg1",
+                    "fields": {
+                        "负责运营": "陈翔宇",
+                        "站点": "UK",
+                        "ASIN": "B0NOSNAP",
+                        "产品": "无快照产品",
+                        "状态": "在跑",
+                        "是否每天更新": "会每天更新",
+                        "rank子表id": "tblRank",
+                    },
+                }
+            ],
+            cfg.wanci_weekly.table_id: [],
+            cfg.action_table_id: [],
+        })
+
+        payload = build_wanci_payload(cfg, fake)
+
+        self.assertEqual(1, payload["summary"]["missing_snapshots"])
+        plan = payload["plans"][0]
+        self.assertEqual("是", plan["rank_tracking"])
+        self.assertIn("暂无周复审快照", plan["issues"])
 
 
 if __name__ == "__main__":

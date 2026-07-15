@@ -36,10 +36,19 @@ POST /dashboard/run?mode=commit
 `GET /api/dashboard` and reorganizes them into summary KPIs, business modules,
 priority actions, source health, owner workload, and a detail pool.
 
-`GET /wanci` is the dedicated Wanci plan workspace. It reads the Wanci weekly
-snapshot source table plus the dashboard action table through `GET /api/wanci`,
-groups rows by site/ASIN/product/owner, and shows task progress, listing
-changes, related todos, and source-record links.
+`GET /wanci` is the dedicated Wanci plan workspace. It reads the Wanci registry
+table as the current project truth, then overlays the weekly snapshot table and
+dashboard action table through `GET /api/wanci`. It groups rows by site/ASIN,
+and shows task progress, listing changes, related todos, and source-record
+links.
+
+P1 data-source audit on 2026-07-15 found that weekly snapshots had stopped at
+2026-06-29 because n8n workflow `QvvnQEUW4g17tOdm` had a broken connection:
+the duplicate `DOW Filter (Mon)` node pointed to itself, leaving `/review`
+unconnected. The workflow was repaired to
+`每周一09:00BJ -> DOW Filter (Mon) -> 调/review复审` and reactivated. The Wanci
+page now uses registry `rank子表id` to decide Rank tracking status, preventing
+stale snapshots from falsely reporting active projects as missing Rank tracking.
 
 If `DASHBOARD_API_TOKEN` is set, `POST /dashboard/run` requires:
 

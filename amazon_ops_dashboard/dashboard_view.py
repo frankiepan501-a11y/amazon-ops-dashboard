@@ -116,11 +116,16 @@ def build_dashboard_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
 
 
 def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
-    source_records = [
+    registry_records = [
+        normalize_wanci_registry(rec, cfg)
+        for rec in lark.list_records(cfg.wanci_registry.app_token, cfg.wanci_registry.table_id, cfg.max_records_per_source)
+    ]
+    registry_records = [x for x in registry_records if x["group_key"]]
+    snapshot_records = [
         normalize_wanci_record(rec, cfg)
         for rec in lark.list_records(cfg.wanci_weekly.app_token, cfg.wanci_weekly.table_id, cfg.max_records_per_source)
     ]
-    source_records = [x for x in source_records if x["group_key"]]
+    snapshot_records = [x for x in snapshot_records if x["group_key"]]
     action_records = [
         normalize_action_record(rec)
         for rec in lark.list_records(cfg.dashboard_base_token, cfg.action_table_id, 10000)
@@ -131,21 +136,21 @@ def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
         if action["source_record_id"]:
             actions_by_record[action["source_record_id"]].append(action)
 
-    grouped: dict[str, dict[str, Any]] = {}
-    for item in source_records:
-        group = grouped.setdefault(item["group_key"], {"latest": None, "history": [], "record_ids": set()})
-        group["history"].append(item)
-        group["record_ids"].add(item["record_id"])
-        latest = group["latest"]
-        if latest is None or item["snapshot_ms"] > latest["snapshot_ms"]:
-            group["latest"] = item
+    snapshots_by_group: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in snapshot_records:
+        snapshots_by_group[item["group_key"]].append(item)
 
     plans = []
-    for group in grouped.values():
-        latest = group["latest"]
-        history = sorted(group["history"], key=lambda x: x["snapshot_ms"], reverse=True)
+    registry_by_group = {item["group_key"]: item for item in registry_records}
+    plan_groups = sorted(set(registry_by_group) | set(snapshots_by_group))
+    for group_key in plan_groups:
+        current = registry_by_group.get(group_key)
+        history = sorted(snapshots_by_group.get(group_key, []), key=lambda x: x["snapshot_ms"], reverse=True)
+        latest_snapshot = history[0] if history else None
+        latest = merge_wanci_current(current, latest_snapshot, cfg)
+        latest["snapshot_record_ids"] = [x["snapshot_record_id"] for x in history if x["snapshot_record_id"]]
         related = []
-        for rid in group["record_ids"]:
+        for rid in latest["snapshot_record_ids"]:
             related.extend(actions_by_record.get(rid, []))
         if not related:
             related = [
@@ -194,15 +199,19 @@ def build_wanci_payload(cfg: Config, lark: LarkClient) -> dict[str, Any]:
     return {
         "generated_at_ms": now_ms(),
         "feishu_base_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.dashboard_base_token}",
-        "source_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_weekly.app_token}?table={cfg.wanci_weekly.table_id}",
+        "source_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_registry.app_token}?table={cfg.wanci_registry.table_id}",
+        "snapshot_source_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_weekly.app_token}?table={cfg.wanci_weekly.table_id}",
         "summary": {
             "plans": len(plans),
+            "active_plans": sum(1 for x in plans if x["registry_status"] == "在跑"),
+            "prep_plans": sum(1 for x in plans if x["registry_status"] == "筹备"),
             "todo_open": sum(x["todo_open"] for x in plans),
             "todo_done": sum(x["todo_done"] for x in plans),
-            "listing_abnormal": sum(1 for x in plans if x["listing_status"] not in ("", "正常")),
-            "budget_exhausted": sum(1 for x in plans if x["budget_exhausted"] > 0),
+            "listing_abnormal": sum(1 for x in plans if x["daily_update"] == "会每天更新" and x["listing_status"] not in ("", "正常")),
+            "budget_exhausted": sum(1 for x in plans if x["daily_update"] == "会每天更新" and x["budget_exhausted"] > 0),
             "no_rank_tracking": sum(1 for x in plans if x["rank_tracking"] == "否"),
-            "stale_snapshots": sum(1 for x in plans if x["age_days"] > 10),
+            "stale_snapshots": sum(1 for x in plans if x["snapshot_ms"] and x["age_days"] > 10 and x["daily_update"] == "会每天更新"),
+            "missing_snapshots": sum(1 for x in plans if not x["snapshot_ms"] and x["daily_update"] == "会每天更新"),
         },
         "owners": owner_rows,
         "plans": plans,
@@ -217,7 +226,7 @@ def normalize_wanci_record(rec: dict[str, Any], cfg: Config) -> dict[str, Any]:
     asin = text_value(f.get("ASIN"))
     product = text_value(f.get("产品"))
     owner = text_value(f.get("负责运营")) or "未分配"
-    group_key = "|".join([site, asin, product, owner]).strip("|") or record_id
+    group_key = wanci_group_key(site, asin, product, owner) or record_id
     include_delta = int_value(f.get("收录Δ"))
     page_delta = int_value(f.get("首页Δ"))
     budget = int_value(f.get("预算耗尽"))
@@ -225,6 +234,7 @@ def normalize_wanci_record(rec: dict[str, Any], cfg: Config) -> dict[str, Any]:
     return {
         "record_id": record_id,
         "group_key": group_key,
+        "snapshot_record_id": record_id,
         "snapshot_ms": snapshot_ms,
         "snapshot": date_text(snapshot_ms),
         "age_days": age_days_from_ms(snapshot_ms),
@@ -242,8 +252,108 @@ def normalize_wanci_record(rec: dict[str, Any], cfg: Config) -> dict[str, Any]:
     }
 
 
+def normalize_wanci_registry(rec: dict[str, Any], cfg: Config) -> dict[str, Any]:
+    f = rec.get("fields") or {}
+    record_id = rec.get("record_id", "")
+    site = text_value(f.get("站点"))
+    asin = text_value(f.get("ASIN"))
+    product = text_value(f.get("产品"))
+    owner = text_value(f.get("负责运营")) or "未分配"
+    rank_table_id = text_value(f.get("rank子表id"))
+    registry_status = text_value(f.get("状态"))
+    daily_update = text_value(f.get("是否每天更新"))
+    rank_updated_ms = parse_time_value(f.get("最近排名更新时间"))
+    return {
+        "registry_record_id": record_id,
+        "group_key": wanci_group_key(site, asin, product, owner) or record_id,
+        "owner": owner,
+        "site": site,
+        "asin": asin,
+        "product": product,
+        "registry_status": registry_status,
+        "daily_update": daily_update,
+        "rank_table_id": rank_table_id,
+        "rank_updated_ms": rank_updated_ms,
+        "rank_updated_at": date_text(rank_updated_ms),
+        "registry_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_registry.app_token}?table={cfg.wanci_registry.table_id}&record={record_id}",
+    }
+
+
+def merge_wanci_current(current: dict[str, Any] | None, snapshot: dict[str, Any] | None, cfg: Config) -> dict[str, Any]:
+    if current:
+        rank_tracking = "是" if current["rank_table_id"] else "暂不追踪" if current["registry_status"] == "筹备" or current["daily_update"] == "暂时不会" else "否"
+        base = {
+            "record_id": current["registry_record_id"],
+            "group_key": current["group_key"],
+            "owner": current["owner"],
+            "site": current["site"],
+            "asin": current["asin"],
+            "product": current["product"],
+            "registry_status": current["registry_status"],
+            "daily_update": current["daily_update"],
+            "rank_tracking": rank_tracking,
+            "rank_table_id": current["rank_table_id"],
+            "rank_updated_ms": current["rank_updated_ms"],
+            "rank_updated_at": current["rank_updated_at"],
+            "registry_url": current["registry_url"],
+            "source_url": current["registry_url"],
+        }
+    else:
+        base = {
+            "record_id": snapshot["record_id"] if snapshot else "",
+            "group_key": snapshot["group_key"] if snapshot else "",
+            "owner": snapshot["owner"] if snapshot else "未分配",
+            "site": snapshot["site"] if snapshot else "",
+            "asin": snapshot["asin"] if snapshot else "",
+            "product": snapshot["product"] if snapshot else "",
+            "registry_status": "未登记",
+            "daily_update": "",
+            "rank_tracking": snapshot["rank_tracking"] if snapshot else "",
+            "rank_table_id": "",
+            "rank_updated_ms": 0,
+            "rank_updated_at": "",
+            "registry_url": "",
+            "source_url": snapshot["source_url"] if snapshot else "",
+        }
+    if snapshot:
+        base.update({
+            "snapshot_record_id": snapshot["snapshot_record_id"],
+            "snapshot_record_ids": [snapshot["snapshot_record_id"]],
+            "snapshot_ms": snapshot["snapshot_ms"],
+            "snapshot": snapshot["snapshot"],
+            "age_days": snapshot["age_days"],
+            "failure": snapshot["failure"],
+            "budget_exhausted": snapshot["budget_exhausted"],
+            "listing_status": snapshot["listing_status"],
+            "include_delta": snapshot["include_delta"],
+            "page_delta": snapshot["page_delta"],
+            "snapshot_url": snapshot["source_url"],
+        })
+    else:
+        base.update({
+            "snapshot_record_id": "",
+            "snapshot_record_ids": [],
+            "snapshot_ms": 0,
+            "snapshot": "",
+            "age_days": 999,
+            "failure": "",
+            "budget_exhausted": 0,
+            "listing_status": "",
+            "include_delta": 0,
+            "page_delta": 0,
+            "snapshot_url": f"https://u1wpma3xuhr.feishu.cn/base/{cfg.wanci_weekly.app_token}?table={cfg.wanci_weekly.table_id}",
+        })
+    return base
+
+
+def wanci_group_key(site: str, asin: str, product: str, owner: str) -> str:
+    return "|".join([site, asin]).strip("|") or "|".join([site, asin, product, owner]).strip("|")
+
+
 def wanci_issue_flags(item: dict[str, Any]) -> list[str]:
     flags = []
+    if item["daily_update"] and item["daily_update"] != "会每天更新":
+        return flags
     if truthy_text(item["failure"]):
         flags.append("存在失职项")
     if item["budget_exhausted"] > 0:
@@ -256,7 +366,9 @@ def wanci_issue_flags(item: dict[str, Any]) -> list[str]:
         flags.append(f"收录下降 {item['include_delta']}")
     if item["page_delta"] < 0:
         flags.append(f"首页下降 {item['page_delta']}")
-    if item["age_days"] > 10:
+    if not item["snapshot_ms"] and item["daily_update"] == "会每天更新":
+        flags.append("暂无周复审快照")
+    elif item["age_days"] > 10 and item["daily_update"] == "会每天更新":
         flags.append(f"快照 {item['age_days']} 天未更新")
     return flags
 
@@ -1242,7 +1354,7 @@ WANCI_HTML = """<!doctype html>
       display: inline-flex; align-items: center; justify-content: center; font-family: inherit; font-size: 13px;
     }
     .button.secondary, button.secondary { background: var(--surface); color: var(--ink); border-color: var(--line); }
-    .kpis { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .kpis { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
     .card, .panel {
       background: rgba(255,253,247,.9); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow);
     }
@@ -1341,8 +1453,8 @@ WANCI_HTML = """<!doctype html>
       </nav>
       <div class="source-card">
         <div>数据源</div>
-        <strong>万词作战台周快照</strong>
-        <div>页面只读；处理动作仍回源记录或待办源表。</div>
+        <strong>万词总台 + 周快照</strong>
+        <div>总台决定当前项目与 Rank 配置；周快照展示 Listing 变化。</div>
         <div id="sideStatus">正在读取数据...</div>
       </div>
     </aside>
@@ -1351,12 +1463,12 @@ WANCI_HTML = """<!doctype html>
         <div>
           <div class="eyebrow">Wanci Plan Operations</div>
           <h1>万词计划工作台</h1>
-          <div class="subtitle">把万词计划从首页拆出来，按 ASIN/站点/产品展示跟进进度、Listing 变化、Rank 追踪、预算耗尽和待办完成情况。</div>
+          <div class="subtitle">把万词计划从首页拆出来，按 ASIN/站点/产品展示跟进进度、Listing 变化、Rank 追踪、预算耗尽和待办完成情况。当前项目以总台注册表为准，周快照只作为复审历史。</div>
         </div>
         <div class="actions">
           <span id="refreshText">未刷新</span>
           <button class="secondary" onclick="loadWanci()">刷新页面数据</button>
-          <a class="button secondary" id="sourceLink" href="#">打开万词源表</a>
+          <a class="button secondary" id="sourceLink" href="#">打开万词总台</a>
         </div>
       </header>
       <section id="kpis" class="kpis"><div class="loading">正在加载万词计划...</div></section>
@@ -1457,13 +1569,14 @@ WANCI_HTML = """<!doctype html>
     function renderKpis() {
       const s = state.data.summary;
       const cards = [
-        ["计划数", s.plans, "按 ASIN/站点/负责人聚合", ""],
+        ["计划数", s.plans, `在跑 ${s.active_plans} / 筹备 ${s.prep_plans}`, ""],
         ["未完成待办", s.todo_open, "需要运营继续处理", s.todo_open ? "danger" : "ok"],
         ["已完成/关闭", s.todo_done, "来自待办状态", "ok"],
         ["Listing异常", s.listing_abnormal, "listing状态非正常", s.listing_abnormal ? "warn" : "ok"],
         ["预算耗尽", s.budget_exhausted, "需要广告预算判断", s.budget_exhausted ? "warn" : ""],
-        ["未建Rank追踪", s.no_rank_tracking, "会影响后续复盘", s.no_rank_tracking ? "warn" : "ok"],
-        ["快照过期", s.stale_snapshots, "超过 10 天未更新", s.stale_snapshots ? "warn" : "ok"],
+        ["未建Rank追踪", s.no_rank_tracking, "按总台 rank子表id 判断", s.no_rank_tracking ? "warn" : "ok"],
+        ["快照过期", s.stale_snapshots, "已有快照但超过 10 天", s.stale_snapshots ? "warn" : "ok"],
+        ["无周快照", s.missing_snapshots, "总台在跑但未进入复审表", s.missing_snapshots ? "danger" : "ok"],
       ];
       $("kpis").innerHTML = cards.map(([label, value, hint, cls]) => `
         <article class="card kpi ${cls}">
@@ -1517,6 +1630,7 @@ WANCI_HTML = """<!doctype html>
           </div>
           <div class="progress"><span style="width:${Math.max(3, p.progress)}%"></span></div>
           <div class="task-meta">
+            ${tag(p.registry_status || "未登记", p.registry_status === "在跑" ? "ok" : "warn")}
             ${tag(`进度 ${p.progress}%`)}
             ${tag(`待办 ${p.todo_done}/${p.todo_total}`)}
             ${tag(`Listing ${p.listing_status || "正常"}`, p.listing_status && p.listing_status !== "正常" ? "warn" : "ok")}
@@ -1556,8 +1670,10 @@ WANCI_HTML = """<!doctype html>
           <div class="todo">
             <strong>${esc(p.product || p.asin)}</strong>
             站点：${esc(p.site || "无")}　ASIN：${esc(p.asin || "无")}　负责人：${esc(p.owner)}<br />
-            Listing状态：${esc(p.listing_status || "正常")}　Rank追踪：${esc(p.rank_tracking || "无")}　预算耗尽：${esc(p.budget_exhausted)}
-            <br /><a class="source-link" href="${esc(p.source_url)}" target="_blank" rel="noreferrer">打开万词源记录</a>
+            总台状态：${esc(p.registry_status || "未登记")}　更新策略：${esc(p.daily_update || "无")}<br />
+            Listing状态：${esc(p.listing_status || "正常")}　Rank追踪：${esc(p.rank_tracking || "无")}　Rank最近更新：${esc(p.rank_updated_at || "无")}　预算耗尽：${esc(p.budget_exhausted)}
+            <br /><a class="source-link" href="${esc(p.registry_url || p.source_url)}" target="_blank" rel="noreferrer">打开万词总台记录</a>
+            ${p.snapshot_url ? ` · <a class="source-link" href="${esc(p.snapshot_url)}" target="_blank" rel="noreferrer">打开周快照记录</a>` : ""}
           </div>
           ${p.issues.length ? `<div class="todo"><strong>当前问题</strong>${p.issues.map((x) => `<div>${esc(x)}</div>`).join("")}</div>` : `<div class="todo"><strong>当前问题</strong>没有明显异常，保持观察。</div>`}
           ${renderTodos(p)}
@@ -1567,7 +1683,7 @@ WANCI_HTML = """<!doctype html>
           ${p.history.map((h) => `
             <div class="row">
               <strong>${esc(h.snapshot || "无日期")}</strong>
-              <span>Listing：${esc(h.listing_status || "正常")} · Rank追踪：${esc(h.rank_tracking || "无")} · 预算耗尽：${esc(h.budget_exhausted)}</span>
+              <span>Listing：${esc(h.listing_status || "正常")} · 快照Rank：${esc(h.rank_tracking || "无")} · 预算耗尽：${esc(h.budget_exhausted)}</span>
               <span>收录Δ ${esc(h.include_delta)} / 首页Δ ${esc(h.page_delta)}</span>
             </div>
           `).join("")}

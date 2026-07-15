@@ -31,6 +31,7 @@ class Config:
     rank_history_table_id: str = "tblpsYye65OvL2D5"
     rank_site_config_table_id: str = "tbl9gFFEy6lMMwSc"
     impression_tasks: SourceTable = SourceTable("Q8LCbeJG6ao6xzsRGZOcn2c8ndh", "tbl56JtPjhiuk640")
+    wanci_registry: SourceTable = SourceTable("W8LPboJSMaVqlwsizQ8cPVDIn2c", "tbl2g78DcPnxWNwO")
     wanci_weekly: SourceTable = SourceTable("W8LPboJSMaVqlwsizQ8cPVDIn2c", "tbl3OipVxS8wyjKk")
 
     rank_country_tables: dict[str, str] = field(default_factory=lambda: {

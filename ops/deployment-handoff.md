@@ -32,10 +32,11 @@ Implemented and verified:
   - `GET /api/dashboard` reads the three Feishu dashboard tables and reorganizes
     rows into KPIs, business modules, priority actions, source health, owner
     workload, and a detail pool.
-  - `GET /wanci` is a dedicated Wanci plan workspace. It reads the Wanci weekly
-    snapshot source table and the dashboard action table via `GET /api/wanci`,
-    then shows plan progress, listing changes, open/completed todos, owner
-    progress, and source-record drill-downs.
+  - `GET /wanci` is a dedicated Wanci plan workspace. It reads the Wanci
+    registry table as current project truth, then overlays the weekly snapshot
+    source table and dashboard action table via `GET /api/wanci`. It shows plan
+    progress, listing changes, open/completed todos, owner progress, and
+    source-record drill-downs.
   - The Feishu Base remains the source-of-truth/detail layer; the web page is
     the management presentation layer.
   - Latest production API check: `human_open=2448`, `p0=986`, `p1=1442`,
@@ -81,7 +82,9 @@ Expected health after 2026-07-15 cloud run:
 - `Rank`: normal
 - `搜索词v2`: error until `SEARCH_TERM_SUMMARY_URL` is configured
 - `展示份额`: stale because the latest completed report is 85 days old
-- `万词作战台`: stale because the latest weekly snapshot is over 7 days old
+- `万词作战台`: stale if the weekly snapshot table is over 7 days old; the
+  dedicated Wanci page still uses the registry table for current project and
+  Rank-tracking truth.
 - `差评审计`: not connected until the customer-service summary endpoint is configured
 
 Implementation note:
@@ -89,6 +92,13 @@ Implementation note:
 - Writes are filtered to the destination Bitable table's actual field list before
   upsert. This prevents optional future metrics, such as review-audit fields, from
   blocking today's core dashboard writes when those columns have not been created.
+- 2026-07-15 P1 audit: Wanci weekly snapshots had stopped at 2026-06-29. The
+  root cause was n8n workflow `QvvnQEUW4g17tOdm` having duplicate
+  `DOW Filter (Mon)` nodes with a self-loop connection, leaving the
+  `调/review复审` node orphaned. The workflow was repaired to
+  `每周一09:00BJ -> DOW Filter (Mon) -> 调/review复审` and reactivated. `/wanci`
+  now derives Rank-tracking status from registry `rank子表id`, not stale
+  weekly snapshots.
 
 ## 2026-07-06 Dashboard V1.1 View Audit Update
 
